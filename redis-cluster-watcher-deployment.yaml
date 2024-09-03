@@ -13,7 +13,7 @@ spec:
       labels:
         app: redis-cluster-watcher
     spec:
-      terminationGracePeriodSeconds: 0
+      #terminationGracePeriodSeconds: 0
       containers:
         - name: redis-cluster
           image: >-
@@ -59,6 +59,29 @@ data:
     
     REDIS_PORT_NUMBER=${REDIS_PORT_NUMBER:-6379}
     END_POD_NUMBER=${END_POD_NUMBER:-5}
+    REDIS_CLI_TIMEOUT=${REDIS_CLI_TIMEOUT:-30}
+    REDIS_CLI_RETRIES=${REDIS_CLI_RETRIES:-3}
+    
+    redis_cli_safe() {
+        local retries=$REDIS_CLI_RETRIES
+        local result
+    
+        while [ $retries -gt 0 ]; do
+            result=$(timeout $REDIS_CLI_TIMEOUT redis-cli "$@")
+            if [ $? -eq 0 ]; then
+                echo "$result"
+                return 0
+            else
+                log_error "Redis command failed: redis-cli $@"
+                retries=$((retries - 1))
+                log "Retries left: $retries"
+                sleep 2
+            fi
+        done
+    
+        log_error "Redis command failed after multiple attempts: redis-cli $@"
+        return 1
+    }
         
     log() {
         echo -e "$(date '+%Y-%m-%d %H:%M:%S') - $1"
@@ -76,7 +99,7 @@ data:
     }
     
     remove_failed_nodes() {
-        failed_nodes=$(redis-cli -h redis-cluster -p $REDIS_PORT_NUMBER CLUSTER NODES | grep fail | awk '{print $1}' | tr '\n' ' ')
+        failed_nodes=$(redis_cli_safe -h redis-cluster -p $REDIS_PORT_NUMBER CLUSTER NODES | grep fail | awk '{print $1}' | tr '\n' ' ')
     
         if [ -z "$failed_nodes" ]; then
             log "No failed nodes found in the cluster."
@@ -88,7 +111,7 @@ data:
         sleep 15
         for failed_node in $failed_nodes; do
             for ((i=0; i<=$END_POD_NUMBER; i++)); do
-                redis-cli -h redis-cluster-$i.redis-cluster-headless -p $REDIS_PORT_NUMBER CLUSTER FORGET $failed_node
+                redis_cli_safe -h redis-cluster-$i.redis-cluster-headless -p $REDIS_PORT_NUMBER CLUSTER FORGET $failed_node
                 
                 if [ $? -eq 0 ]; then
                     log "Node $failed_node removed from cluster on redis-cluster-$i"
@@ -110,7 +133,7 @@ data:
     find_new_pods_ips() {
         find_unique_ips
         
-        ip_addresses=$(redis-cli -h redis-cluster -p 6379 CLUSTER NODES | awk '{split($2, a, ":"); print a[1]}' | tr '\n' ' ')      
+        ip_addresses=$(redis_cli_safe -h redis-cluster -p 6379 CLUSTER NODES | awk '{split($2, a, ":"); print a[1]}' | tr '\n' ' ')      
         # log "IP addresses of all nodes in the cluster: ${ip_addresses}"
         
         unique_ips_array=($unique_ips)
@@ -143,7 +166,7 @@ data:
     
     add_new_pods_to_cluster() {
         for new_pod_ip in "${new_pods_ips[@]}"; do
-            redis-cli -h redis-cluster -p $REDIS_PORT_NUMBER CLUSTER MEET $new_pod_ip $REDIS_PORT_NUMBER
+            redis_cli_safe -h redis-cluster -p $REDIS_PORT_NUMBER CLUSTER MEET $new_pod_ip $REDIS_PORT_NUMBER
             log "Node $new_pod_ip added to the cluster."
         done
     }
@@ -154,7 +177,7 @@ data:
         local -n masters_without_replicas_ref=$3
         local redis_cluster_info
         
-        redis_cluster_info=$(redis-cli -h redis-cluster -p $REDIS_PORT_NUMBER CLUSTER NODES)
+        redis_cluster_info=$(redis_cli_safe -h redis-cluster -p $REDIS_PORT_NUMBER CLUSTER NODES)
     
         while IFS= read -r node; do
             node_id=$(echo $node | awk '{print $1}')
@@ -169,7 +192,7 @@ data:
                 else
                     masters_with_slots_ref+=("$node_id")
                     
-                    replicas=$(redis-cli -h redis-cluster-0.redis-cluster-headless -p $REDIS_PORT_NUMBER CLUSTER REPLICAS $node_id)
+                    replicas=$(redis_cli_safe -h redis-cluster-0.redis-cluster-headless -p $REDIS_PORT_NUMBER CLUSTER REPLICAS $node_id)
                     if [ -z "$replicas" ]; then
                         log "Master $node_id has assigned slots but no replicas."
                         masters_without_replicas_ref+=("$node_id")
@@ -197,7 +220,7 @@ data:
             return 1
         fi
     
-        redis_cluster_info=$(redis-cli -h redis-cluster -p "$REDIS_PORT_NUMBER" CLUSTER NODES)
+        redis_cluster_info=$(redis_cli_safe -h redis-cluster -p "$REDIS_PORT_NUMBER" CLUSTER NODES)
         # log "Redis cluster info: $redis_cluster_info"
     
         for master_id in "${masters_without_replicas[@]}"; do
@@ -211,7 +234,7 @@ data:
                     continue
                 fi
     
-                redis-cli -h "$replica_ip" -p "$REDIS_PORT_NUMBER" CLUSTER REPLICATE "$master_id"
+                redis_cli_safe -h "$replica_ip" -p "$REDIS_PORT_NUMBER" CLUSTER REPLICATE "$master_id"
                 if [ $? -eq 0 ]; then
                     log "Empty master $replica_candidate_id set as a replica for master $master_id"
                     masters_without_slots=($(printf "%s\n" "${masters_without_slots[@]}" | grep -v "^$replica_candidate_id\$"))
@@ -228,7 +251,7 @@ data:
         done
       
         sleep 15
-        log "Redis cluster info after update: \n$(redis-cli -h redis-cluster -p "$REDIS_PORT_NUMBER" CLUSTER NODES)"
+        log "Redis cluster info after update: \n$(redis_cli_safe -h redis-cluster -p "$REDIS_PORT_NUMBER" CLUSTER NODES)"
     
         return 0
     }
